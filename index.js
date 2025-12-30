@@ -13,7 +13,7 @@ const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const CHANNEL_ID = "1453914494823563339";
 const PS_SERVER = "wss://sim3.psim.us/showdown/websocket";
 
-// High-traffic tournament rooms (covers ~90%)
+// High-traffic tournament rooms (~90% coverage)
 const ROOMS = [
   "lobby",
   "ou",
@@ -25,6 +25,10 @@ const ROOMS = [
   "toursplaza",
   "smogondoubles"
 ];
+
+// Auto-clean settings
+const MAX_TOURNAMENT_AGE = 30 * 60 * 1000; // 30 minutes
+const CLEANUP_INTERVAL = 5 * 60 * 1000;   // every 5 minutes
 
 // ================= DISCORD =================
 const discord = new Client({
@@ -53,8 +57,18 @@ discord.once("clientReady", async () => {
 await discord.login(DISCORD_TOKEN);
 
 // ================= STATE =================
-// key = `${room}:${format}`
+// key = room
 const activeTournaments = new Map();
+/*
+{
+  room,
+  format,
+  name,
+  messageId,
+  startTime
+}
+*/
+
 let currentRoom = null;
 
 // ================= SHOWDOWN =================
@@ -79,15 +93,13 @@ ws.on("message", async (data) => {
       continue;
     }
 
-    if (!currentRoom) continue;
-
     // -------- TOURNAMENT CREATED --------
-    if (line.startsWith("|tournament|create|")) {
+    if (line.startsWith("|tournament|create|") && currentRoom) {
       const parts = line.split("|");
       const format = parts[3];
       const name = parts[6] ?? format;
 
-      const key = `${currentRoom}:${format}`;
+      const key = currentRoom; // one tournament per room
       if (activeTournaments.has(key)) continue;
 
       console.log(`🏆 Tournament detected: ${name} (${currentRoom})`);
@@ -104,28 +116,54 @@ ws.on("message", async (data) => {
         room: currentRoom,
         format,
         name,
-        messageId: sent.id
+        messageId: sent.id,
+        startTime: Date.now()
       });
     }
 
-    // -------- TOURNAMENT ENDED --------
-    if (line.startsWith("|tournament|end|")) {
-      for (const [key, tour] of activeTournaments) {
-        if (tour.room !== currentRoom) continue;
+    // -------- TOURNAMENT ENDED (ALL CASES) --------
+    if (
+      line.startsWith("|tournament|end|") ||
+      line.startsWith("|tournament|forceend") ||
+      line.startsWith("|tournament|expire")
+    ) {
+      for (const [room, tour] of activeTournaments) {
+        if (currentRoom && room !== currentRoom) continue;
 
         try {
           const channel = await discord.channels.fetch(CHANNEL_ID);
           const msg = await channel.messages.fetch(tour.messageId);
           await msg.delete();
-          console.log(`🗑 Tournament ended: ${tour.name}`);
+          console.log(`🗑 Tournament ended: ${tour.name} (${room})`);
         } catch {}
 
-        activeTournaments.delete(key);
-        break; // one tournament per room
+        activeTournaments.delete(room);
+        break;
       }
     }
   }
 });
+
+// ================= AUTO-CLEANUP =================
+setInterval(async () => {
+  const now = Date.now();
+
+  for (const [room, tour] of activeTournaments) {
+    if (now - tour.startTime < MAX_TOURNAMENT_AGE) continue;
+
+    console.log(
+      `🧹 Auto-cleaned tournament after 30m: ${tour.name} (${room})`
+    );
+
+    try {
+      const channel = await discord.channels.fetch(CHANNEL_ID);
+      const msg = await channel.messages.fetch(tour.messageId);
+      await msg.delete();
+    } catch {}
+
+    activeTournaments.delete(room);
+  }
+}, CLEANUP_INTERVAL);
 
 // ================= SLASH COMMAND =================
 discord.on("interactionCreate", async (interaction) => {
