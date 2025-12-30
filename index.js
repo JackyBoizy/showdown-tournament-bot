@@ -8,6 +8,14 @@ import {
   SlashCommandBuilder
 } from "discord.js";
 
+// ================= LOGGER =================
+function log(level, message, extra = null) {
+  const ts = new Date().toISOString();
+  const prefix = `[${ts}] [${level.toUpperCase()}]`;
+  if (extra !== null) console.log(prefix, message, extra);
+  else console.log(prefix, message);
+}
+
 // ================= CONFIG =================
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const CHANNEL_ID = "1453914494823563339";
@@ -35,8 +43,17 @@ const discord = new Client({
   intents: [GatewayIntentBits.Guilds]
 });
 
+async function getDiscordChannel() {
+  try {
+    return await discord.channels.fetch(CHANNEL_ID);
+  } catch (err) {
+    log("error", "Cannot access Discord channel", err?.code);
+    return null;
+  }
+}
+
 discord.once("clientReady", async () => {
-  console.log(`✅ Discord logged in as ${discord.user.tag}`);
+  log("info", `Discord logged in as ${discord.user.tag}`);
 
   const commands = [
     new SlashCommandBuilder()
@@ -45,13 +62,16 @@ discord.once("clientReady", async () => {
       .toJSON()
   ];
 
-  const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
-  await rest.put(
-    Routes.applicationCommands(discord.user.id),
-    { body: commands }
-  );
-
-  console.log("✅ Slash command /tournaments registered");
+  try {
+    const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
+    await rest.put(
+      Routes.applicationCommands(discord.user.id),
+      { body: commands }
+    );
+    log("info", "Slash command /tournaments registered");
+  } catch (err) {
+    log("error", "Failed to register slash commands", err?.code);
+  }
 });
 
 await discord.login(DISCORD_TOKEN);
@@ -68,17 +88,24 @@ const activeTournaments = new Map();
   startTime
 }
 */
-
 let currentRoom = null;
 
 // ================= SHOWDOWN =================
 const ws = new WebSocket(PS_SERVER);
 
 ws.on("open", () => {
-  console.log("🟢 Connected to Pokémon Showdown");
+  log("info", "Connected to Pokémon Showdown");
   for (const room of ROOMS) {
     ws.send(`|/join ${room}`);
   }
+});
+
+ws.on("close", () => {
+  log("warn", "Disconnected from Pokémon Showdown");
+});
+
+ws.on("error", err => {
+  log("error", "Showdown WebSocket error", err.message);
 });
 
 ws.on("message", async (data) => {
@@ -95,24 +122,31 @@ ws.on("message", async (data) => {
 
     // -------- TOURNAMENT CREATED --------
     if (line.startsWith("|tournament|create|") && currentRoom) {
+      if (activeTournaments.has(currentRoom)) continue;
+
       const parts = line.split("|");
       const format = parts[3];
       const name = parts[6] ?? format;
 
-      const key = currentRoom; // one tournament per room
-      if (activeTournaments.has(key)) continue;
+      log("info", `Tournament detected: ${name} (${currentRoom})`);
 
-      console.log(`🏆 Tournament detected: ${name} (${currentRoom})`);
+      const channel = await getDiscordChannel();
+      if (!channel) continue;
 
-      const channel = await discord.channels.fetch(CHANNEL_ID);
-      const sent = await channel.send(
-        `🏆 **Tournament Open!**\n` +
-        `**Format:** ${name}\n` +
-        `**Room:** ${currentRoom}\n` +
-        `Join → https://play.pokemonshowdown.com/${currentRoom}`
-      );
+      let sent;
+      try {
+        sent = await channel.send(
+          `🏆 **Tournament Open!**\n` +
+          `**Format:** ${name}\n` +
+          `**Room:** ${currentRoom}\n` +
+          `Join → https://play.pokemonshowdown.com/${currentRoom}`
+        );
+      } catch (err) {
+        log("error", "Failed to post tournament message", err?.code);
+        continue;
+      }
 
-      activeTournaments.set(key, {
+      activeTournaments.set(currentRoom, {
         room: currentRoom,
         format,
         name,
@@ -121,25 +155,65 @@ ws.on("message", async (data) => {
       });
     }
 
-    // -------- TOURNAMENT ENDED (ALL CASES) --------
+    // -------- TOURNAMENT ENDED (WITH RESULTS) --------
+    if (line.startsWith("|tournament|end|")) {
+      const tour = activeTournaments.get(currentRoom);
+      if (!tour) continue;
+
+      let results = null;
+      try {
+        results = JSON.parse(line.slice(16))?.results ?? null;
+      } catch {
+        log("warn", "Failed to parse tournament results JSON");
+      }
+
+      const channel = await getDiscordChannel();
+      if (channel) {
+        try {
+          if (results?.length) {
+            const [w, r, t] = results;
+            let msg =
+              `🏁 **Tournament Finished!**\n` +
+              `**Format:** ${tour.name}\n` +
+              `🥇 **Winner:** ${w?.join(", ")}`;
+            if (r) msg += `\n🥈 **Runner-up:** ${r.join(", ")}`;
+            if (t) msg += `\n🥉 **3rd Place:** ${t.join(", ")}`;
+            await channel.send(msg);
+          } else {
+            await channel.send(`🏁 **Tournament Finished:** ${tour.name}`);
+          }
+        } catch (err) {
+          log("error", "Failed to post results", err?.code);
+        }
+
+        try {
+          const m = await channel.messages.fetch(tour.messageId);
+          await m.delete();
+        } catch {}
+      }
+
+      log("info", `Tournament completed: ${tour.name}`);
+      activeTournaments.delete(currentRoom);
+    }
+
+    // -------- FORCE / EXPIRE --------
     if (
-      line.startsWith("|tournament|end|") ||
       line.startsWith("|tournament|forceend") ||
       line.startsWith("|tournament|expire")
     ) {
-      for (const [room, tour] of activeTournaments) {
-        if (currentRoom && room !== currentRoom) continue;
+      const tour = activeTournaments.get(currentRoom);
+      if (!tour) continue;
 
+      const channel = await getDiscordChannel();
+      if (channel) {
         try {
-          const channel = await discord.channels.fetch(CHANNEL_ID);
-          const msg = await channel.messages.fetch(tour.messageId);
-          await msg.delete();
-          console.log(`🗑 Tournament ended: ${tour.name} (${room})`);
+          const m = await channel.messages.fetch(tour.messageId);
+          await m.delete();
         } catch {}
-
-        activeTournaments.delete(room);
-        break;
       }
+
+      log("warn", `Tournament force-ended: ${tour.name}`);
+      activeTournaments.delete(currentRoom);
     }
   }
 });
@@ -151,22 +225,22 @@ setInterval(async () => {
   for (const [room, tour] of activeTournaments) {
     if (now - tour.startTime < MAX_TOURNAMENT_AGE) continue;
 
-    console.log(
-      `🧹 Auto-cleaned tournament after 30m: ${tour.name} (${room})`
-    );
+    log("warn", `Auto-cleaned stale tournament: ${tour.name}`);
 
-    try {
-      const channel = await discord.channels.fetch(CHANNEL_ID);
-      const msg = await channel.messages.fetch(tour.messageId);
-      await msg.delete();
-    } catch {}
+    const channel = await getDiscordChannel();
+    if (channel) {
+      try {
+        const msg = await channel.messages.fetch(tour.messageId);
+        await msg.delete();
+      } catch {}
+    }
 
     activeTournaments.delete(room);
   }
 }, CLEANUP_INTERVAL);
 
 // ================= SLASH COMMAND =================
-discord.on("interactionCreate", async (interaction) => {
+discord.on("interactionCreate", async interaction => {
   if (!interaction.isChatInputCommand()) return;
 
   if (interaction.commandName === "tournaments") {
